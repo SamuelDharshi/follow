@@ -1,0 +1,18 @@
+services:
+  recorder:
+    build: .
+    command: python -m follow.recorder
+    restart: always
+    env_file: [.env]
+    environment: { FOLLOW_DB: /data/follow.db }
+    volumes: [followdata:/data]
+  api:
+    build: .
+    command: python -m follow.api
+    restart: always
+    env_file: [.env]
+    environment: { FOLLOW_DB: /data/follow.db, FOLLOW_EXPORT_DIR: /data/export }
+    ports: ["8000:8000"]
+    volumes: [followdata:/data]
+volumes:
+  followdata:
