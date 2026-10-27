@@ -4,7 +4,7 @@ Flow from the spec and their "Accessing Zetaris using API" article: GET /api/v1.
 refreshToken; every other call needs X-Org-ID, X-Request-ID and a Bearer token. SQL runs as POST /api/v1.0/query/sql/start {select, pageLimit<=100} ->
 GET /api/v1.0/query/sql/page -> DELETE /api/v1.0/query/sql/close/{queryToken}.
 
-Nothing here runs unless ZETARIS_ORG_ID, ZETARIS_USERNAME, ZETARIS_PASSWORD and ZETARIS_API_KEY are set, so the agent never pretends to have used it.
+Nothing here runs unless ZETARIS_ORG_ID, ZETARIS_USERNAME, ZETARIS_PASSWORD and ZETARIS_SAMPLES_TABLE are set (ZETARIS_API_KEY is optional), so the agent never pretends to have used it.
 Env: ZETARIS_BASE_URL (default https://api.saas.enterprise.zetaris.com), ZETARIS_SAMPLES_TABLE (the table holding Follow's book_samples Parquet).
 """
 import os
@@ -19,7 +19,8 @@ _token = {"id": None, "at": 0.0}
 
 
 def configured() -> bool:
-    return all(os.environ.get(k) for k in ("ZETARIS_ORG_ID", "ZETARIS_USERNAME", "ZETARIS_PASSWORD", "ZETARIS_API_KEY", "ZETARIS_SAMPLES_TABLE"))
+    # ZETARIS_API_KEY is optional: the SaaS console issues one, a local install does not (the login idToken is the Bearer there)
+    return all(os.environ.get(k) for k in ("ZETARIS_ORG_ID", "ZETARIS_USERNAME", "ZETARIS_PASSWORD", "ZETARIS_SAMPLES_TABLE"))
 
 
 def _headers(bearer: str | None = None) -> dict:
@@ -43,7 +44,7 @@ def login() -> str:
 def _call(method: str, path: str, **kw):
     """The article says the Bearer is the API key; if the server wants the login idToken instead, retry once with it."""
     last = None
-    for bearer in (os.environ["ZETARIS_API_KEY"], None):
+    for bearer in ([os.environ["ZETARIS_API_KEY"]] if os.environ.get("ZETARIS_API_KEY") else []) + [None]:
         tok = bearer or login()
         r = httpx.request(method, BASE() + path, headers=_headers(tok), timeout=60, **kw)
         if r.status_code not in (401, 403):
