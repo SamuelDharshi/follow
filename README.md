@@ -1,380 +1,407 @@
-# Follow: the Strike market quality index
+# Follow: an investigator agent for market liquidity
 
-> **How deep is Strike's book?**
-> Follow records Strike's public **L3** (every resting order) BTC-USD feed live, measures its liquidity quality the
-> same way as Binance and Hyperliquid, and publishes the result as a live scorecard, an open dataset and a read-only API.
+> **Ask a liquidity question. Get an answer where every number is traced to a recorded measurement, the gaps in the data are named, and the confidence is lowered when the data is thin.**
 
-**Live:** (not deployed yet)  |  **Demo video:** (not recorded yet)  |  **Strike feedback:** [FEEDBACK.md](FEEDBACK.md)
+Built for the **Open Agent Hackathon 2026** (NVIDIA Nemotron, Zetaris, Meterless). It sits on top of a real recorder that has been watching Strike's order book, Binance and Hyperliquid since the Strike hackathon. No mocked data, no simulated books.
 
-Everything here runs on **live public market data**. There is no mock data, no simulated order book and no seeded numbers.
-The one model in the product (the incentive designer) is a clearly labelled what-if. See [FEEDBACK.md](FEEDBACK.md) for the
-architectural pain point in Strike's L3 feed that this project surfaced, with evidence and a proposed fix.
+- [1. The idea](#1-the-idea)
+- [2. How it works](#2-how-it-works)
+- [3. The honesty layer](#3-the-honesty-layer)
+- [4. Using the app](#4-using-the-app)
+- [5. Run it yourself](#5-run-it-yourself)
+- [6. Sponsor technologies](#6-sponsor-technologies)
+- [7. The data underneath](#7-the-data-underneath)
+- [8. Repository layout](#8-repository-layout)
+- [9. Honest limits](#9-honest-limits)
 
 ---
 
 ## 1. The idea
 
-**The problem.** Strike's perps volume is thin (roughly $0.3M a day on DefiLlama). Thin books mean slippage. Slippage keeps traders
-and market makers away, and that keeps the books thin. Nobody outside Strike has an independent, public number for *how* thin the book
-is, *versus whom*, or *whether a liquidity programme works*.
+**The problem.** "Is Strike liquid enough to trade $100k?" is a question traders and market makers ask constantly. The usual answers are a screenshot, a dashboard number with no source, or a language model's confident paragraph. A model with no access to data invents numbers. A model with access can still misread them, round them, or quietly skip the part of the day when the feed was down.
 
-**The insight.** Strike publishes something almost no exchange does: a public **Level 3** feed, i.e. every individual resting order
-with its FIFO position. L2 only tells you "$X at this price". L3 also tells you who is quoting, how long quotes live, what gets cancelled
-and what actually trades. That is enough to measure liquidity *quality*, not just size.
+**The approach.** Follow splits the job in two and does not let the language model grade its own work:
 
-**The product.** Follow turns that feed into:
+1. The **agent** (NVIDIA Nemotron) decides which measurements to fetch, by calling a small set of read-only tools (coverage, scorecard, series, gaps, resilience, toxicity, cancel_fill, plus an optional Zetaris summary).
+2. The **verifier** (plain code, no model) checks every claim the agent makes against what the tools actually returned. A sentence with a number that no tool produced is removed. Gaps in the recording that overlap the question are attached. Confidence is lowered when they do.
 
-| What | For whom | Where |
-| --- | --- | --- |
-| A live **scorecard**: spread uptime, depth, slippage at size, cancel/fill, depth resilience, next to Binance and Hyperliquid | Strike team, traders, judges | `/scorecard` |
-| An **incentive designer**: "if we paid a 1 bp maker rebate to 3 Quoters, what would depth and slippage look like?" | Strike team sizing STRIKE spend | `/designer` |
-| An **open dataset** (Parquet) and a **read-only API** with every outage marked | Builders, market makers | `/data`, `/api/*` |
-| A one-page **methodology** with every definition and known limit | Anyone who wants to check our work | `/methodology` |
+So the output is not "what the model thinks". It is *what the recorder measured, as far as the checks could confirm*, with the model doing the reading and the code doing the policing.
 
-**The pitch.** *"Strike's problem is thin liquidity. This tells the team exactly how thin, versus whom, and what a rebate or Quoter
-programme would buy, before they spend STRIKE on it."*
+**What you get for each question**
 
-**What it is not.** No trading, no wallets, no funds, no predictions, BTC-USD only (the only symbol with public L3), and no claim about
-exchange integrity. It measures liquidity, not honesty.
+| Part | Meaning |
+|---|---|
+| Answer | Short prose, only sentences backed by a claim |
+| Claims | Each: text, tool used, arguments, the value returned |
+| Gaps affecting the answer | Recording gaps that overlap the window asked about |
+| Confidence | high / medium / low, lowered by gaps and by unbacked claims |
+| Evidence cards | The raw tool results, with a small chart |
+
+**Example.** *"How much slippage would a $50k market buy take on Strike versus Binance?"* The agent calls the slippage tool for both venues, writes two claims with the returned values, the verifier confirms them, finds no gap in the window, and returns `confidence: high`. If the Strike recorder was offline for 40 minutes inside the window, the same question returns the same numbers with `confidence: medium` and the 40-minute gap listed.
 
 ---
 
-## 2. How it works at a glance
+## 2. How it works
 
-```
-   PUBLIC FEEDS                       FOLLOW RECORDER (one process, 4 tasks)                    STORE
- ┌────────────────────┐            ┌──────────────────────────────────────────┐          ┌──────────────┐
- │ Strike L3          │──snapshot─▶│ strike_l3   sync + gap detection         │──events─▶│              │
- │  REST + WebSocket  │──stream───▶│             local L3 book, 2 s samples   │──samples▶│              │
- ├────────────────────┤            ├──────────────────────────────────────────┤          │   SQLite     │
- │ Strike market WS   │──trades───▶│ strike_market  trade tape, bookTicker    │──────────▶│   (WAL)      │
- ├────────────────────┤            ├──────────────────────────────────────────┤          │              │
- │ Binance depth      │──stream───▶│ binance     local book, 1000-lvl snapshot│──samples▶│  l3_events   │
- ├────────────────────┤            ├──────────────────────────────────────────┤          │  book_samples│
- │ Hyperliquid l2Book │──stream───▶│ hyperliquid two granularities            │──samples▶│  snapshots   │
- └────────────────────┘            └──────────────────────────────────────────┘          │  gaps        │
-                                                                                          └──────┬───────┘
-                                                                                                 │ read-only
-        ┌────────────────────────────────────────────────────────────────────────────────────────┤
-        ▼                                         ▼                                              ▼
- ┌───────────────┐                       ┌─────────────────┐                           ┌──────────────────┐
- │ Metrics engine│──M1..M5 per window───▶│  FastAPI :8000  │──JSON────────────────────▶│ Next.js frontend │
- │  (rollups)    │                       │  /api/*         │                           │  scorecard,      │
- └───────────────┘                       │  Parquet export │──files───────────────────▶│  designer, data  │
-                                         └─────────────────┘                           └──────────────────┘
-```
-
-### 2.1 Sequence diagram: from a Strike order to a number on the scorecard
+### 2.1 Sequence of one question
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant S as Strike (L3 REST + WS)
-    participant R as Follow recorder
-    participant DB as SQLite store
-    participant E as Metrics engine / API
-    participant U as User (browser)
+    actor U as User
+    participant W as /ask page (Next.js)
+    participant A as POST /api/ask (FastAPI)
+    participant G as Agent loop
+    participant N as NVIDIA Nemotron
+    participant T as Tools (read-only API functions)
+    participant D as SQLite + Zetaris
+    participant V as Verifier (code)
+    participant M as H-MEM memory
 
-    R->>S: SUBSCRIBE btc-usd@l3 (start buffering)
-    R->>S: GET /v2/l3/snapshot
-    S-->>R: full book at last_sequence = N
-    R->>R: drop buffered events <= N, apply N+1, N+2 ...
-    loop every update
-        S-->>R: l3_update (open / cancel / fill), sequence = n
-        alt sequence == expected
-            R->>DB: store raw event, apply to local book
-        else gap, clear action or disconnect
-            R->>DB: write gap marker
-            R->>S: fresh snapshot, rebuild book
-        end
+    U->>W: type a liquidity question
+    W->>A: POST {question}
+    A->>G: ask(question)
+    G->>M: recall(question)
+    M-->>G: past verified findings
+    loop up to 6 steps
+        G->>N: messages + tool catalogue
+        N-->>G: tool calls (batched)
+        G->>T: run_tool(name, args)
+        T->>D: query recorded samples
+        D-->>T: rows
+        T-->>G: result JSON
     end
-    loop every 2 s (between refresh bursts)
-        R->>R: walk the local book: spread, depth, slippage
-        R->>DB: store one book sample
-    end
-    U->>E: GET /api/scorecard
-    E->>DB: aggregate samples and events (gaps excluded)
-    E-->>U: M1..M5 for Strike, Binance, Hyperliquid + sample counts
+    N-->>G: JSON {answer, claims, gaps, confidence}
+    G->>V: verify claims, strip unbacked, find gaps
+    V-->>G: checked answer
+    G->>M: remember verified findings
+    G-->>A: answer + claims + evidence
+    A-->>W: JSON
+    W-->>U: answer, gaps, confidence, evidence cards
 ```
 
-### 2.2 The recorder state machine (why a gap can never corrupt a number)
+### 2.2 System architecture
 
 ```
-                     ┌────────────────────────────────────────────┐
-                     │                CONNECTING                  │
-                     │  open WebSocket, send SUBSCRIBE, buffer    │
-                     └───────────────────┬────────────────────────┘
-                                         ▼
-                     ┌────────────────────────────────────────────┐
-                     │                 SNAPSHOT                   │
-                     │  GET /v2/l3/snapshot  -> book at seq N     │
-                     └───────────────────┬────────────────────────┘
-                                         ▼
-                     ┌────────────────────────────────────────────┐
-                     │                 SYNCED                     │◀─────────┐
-                     │  expect seq N+1, N+2 ... apply + store     │          │ next event
-                     └───────┬──────────────┬──────────────┬──────┘          │ seq == expected
-              seq > expected │   `clear`    │  disconnect  │                 │
-                             ▼   action     ▼  / error     ▼                 │
-                     ┌────────────────────────────────────────────┐          │
-                     │             GAP: write marker              │          │
-                     │  start = last event time, reason recorded  │          │
-                     │  back-off 1,2,4 .. 30 s, then CONNECTING   │──────────┘ (marker closed at next snapshot)
-                     └────────────────────────────────────────────┘
-        Process restarts are also gaps: the previous heartbeat time opens a marker.
-        Metrics never interpolate across a gap; coverage is shown beside every number.
+ Browser
+   |  /ask  /scorecard  /designer  /methodology  /data
+   v
++-----------------------+          +------------------------------------+
+|  Next.js front end    |  HTTPS   |  FastAPI  (follow/api.py)          |
+|  (web/)               |--------->|  read-only endpoints + /api/ask    |
++-----------------------+          +----------------+-------------------+
+                                                    |
+                              +---------------------+----------------------+
+                              |                                            |
+                    +---------v----------+                     +-----------v-----------+
+                    |  Agent             |                     |  Metrics engine       |
+                    |  follow/agent.py   |-- tools call ------>|  follow/metrics.py    |
+                    |  verify + strip    |                     |  spread, depth,       |
+                    +----+-----------+---+                     |  slippage, cancels,   |
+                         |           |                         |  resilience, toxicity |
+              +----------v--+   +----v-----------+             +-----------+-----------+
+              | NVIDIA      |   | H-MEM subset   |                         |
+              | Nemotron    |   | follow/hmem.py |             +-----------v-----------+
+              | (chat API)  |   +----------------+             |  SQLite  (recorded)   |
+              +-------------+                                  |  samples, events,     |
+                         |                                     |  gaps, rollups        |
+              +----------v-------------+                       +-----------^-----------+
+              | Zetaris (optional)     |<-- Parquet export ---+            |
+              | SQL over book_samples  |                       |  +---------+-----------+
+              +------------------------+                       +--|  Recorder (24/7)    |
+                                                                  |  Strike L3 + WS     |
+                                                                  |  Binance, Hyperliq. |
+                                                                  +---------------------+
 ```
 
-### 2.3 How one metric sample is made (walking the book)
+### 2.3 The agent loop
 
 ```
-   ASKS (lowest first)                     mid = (best bid + best ask) / 2
-   $81,023  0.40 BTC   ────┐               spread = (ask - bid) / mid
-   $81,021  0.10 BTC       │ buy $50k      depth within N bps = sum(price x size) for levels inside mid +- N bps
-   $81,020  0.35 BTC   ────┘ walks up      slippage = (average fill price - mid) / mid
-   ───────── mid $81,019.5 ─────────
-   $81,019  0.30 BTC   ────┐ sell $50k
-   $81,018  0.12 BTC       │ walks down    If the visible book cannot fill the order the sample is excluded
-   $81,016  0.25 BTC   ────┘               from the average and the fill share is reported instead.
-   BIDS (highest first)                    Benchmarks use the identical code (follow/ladder.py).
+ question
+    |
+    v
+ recall past findings (H-MEM, relevance >= 0.35)
+    |
+    v
+ +-----------------------------------------------+
+ |  step 1..6                                    |
+ |   model sees: question + memory + tool list   |
+ |        |                                      |
+ |        +-- tool calls?  yes --> run all of them in one batch
+ |        |                         append results, next step
+ |        +-- no  --> final JSON answer          |
+ +-----------------------------------------------+
+    |
+    v
+ bad JSON?  -> one repair attempt, then give up honestly
+    |
+    v
+ verifier (section 3) -> final response
 ```
 
-### 2.4 What the user sees (page flow)
+Why max 6 steps: each step is a network round trip to the model. Six is enough for a three-venue comparison with a gap check, and bounds the cost of a bad question.
+
+### 2.4 The front end flow
 
 ```
-  /  (landing)  ──────────────▶  /scorecard  ─── window: 15 m | 1 h | 6 h | 24 h
-   hero: live book art            ├─ "Strike, in its own terms"   M1..M4 cards, change vs previous window
-   what does a $50k order         ├─ trend charts (3 h / 12 h / 48 h), gaps drawn as gaps
-   cost right now?                ├─ "Versus Binance and Hyperliquid"  table + comparison charts
-   findings carousel              ├─ "What only L3 shows"  placed / cancelled / filled, M5 resilience
-        │                         └─ "Data behind these numbers"  hours recorded, coverage, gaps
-        ├──────────────────────▶  /designer   rebate, Quoters, size  ──▶ modelled depth + slippage (banner: what-if)
-        ├──────────────────────▶  /methodology  every definition, data window, known limits
-        └──────────────────────▶  /data        Parquet files per table per day + schema + query endpoint
+ /ask
+  |
+  |-- 5 suggested questions (click to fill)
+  |-- question box --> POST /api/ask --> spinner
+  |                                          |
+  |            +-----------------------------+
+  |            v
+  |   [ answer banner + confidence badge ]
+  |   [ gaps box: "Strike L3 offline 02:10-02:50" ]
+  |   [ evidence cards: tool, args, value, mini chart ]
+  |
+  +-- every number in the banner appears again in a card below it
 ```
 
 ---
 
-## 3. The metrics
+## 3. The honesty layer
 
-All values are computed on a 2-second clock from the full local book and rolled up to 1-minute, hourly and daily windows.
-Every number is shown with its sample count; recording gaps are excluded, never interpolated.
+All of this is ordinary code in [follow/agent.py](follow/agent.py), covered by tests in [tests/test_agent.py](tests/test_agent.py).
 
-| # | Metric | Definition | Strike | Binance / Hyperliquid |
-| --- | --- | --- | --- | --- |
-| M1 | Spread uptime | Share of samples with a two-sided book and spread <= 5 bps | L3 book | L2 book |
-| M2 | Depth within N bps | USD resting within 5, 10, 25 bps of mid, per side | L3 book | L2 book (n/a where the feed does not reach) |
-| M3 | Slippage at size | Cost vs mid of a $10k / $50k / $100k market order, by walking the book | L3 book | L2 book |
-| M4 | Cancel / fill | Cancelled size over filled size, plus counts of placed, cancelled, filled | L3 events | not available |
-| M5 | Depth resilience | Time for depth within 10 bps to recover to 80% after a taker order above $10k | L3 events | not built |
-| M6 | Flow toxicity | Average mid-price move in the taker's direction over the 10 s after each taker order | L3 events + Strike samples | not available |
+```
+ model's claims                        tool results from this question
+ [{text, tool, args, value}, ...]      {tool, args} -> result JSON
+          \                                    /
+           \                                  /
+            v                                v
+        +----------------------------------------+
+        |  verify(claim)                         |
+        |   - tool+args were really called?      |
+        |   - value found in that result?        |
+        |   - tolerant to 12%, 12.0%, 1.2k,      |
+        |     993 ms vs 0.993 s                  |
+        +--------------------+-------------------+
+                             |
+          claim ok? ---- no ---> claim dropped
+                             |
+                             v
+        +----------------------------------------+
+        |  strip_unbacked(answer)                |
+        |   every sentence with a number must be |
+        |   backed by a verified claim, or the   |
+        |   number must come from the question   |
+        |   ("$50k") or the tool args            |
+        +--------------------+-------------------+
+                             |
+                             v
+        +----------------------------------------+
+        |  gaps_affecting(window)                |
+        |   intersect the question's time window |
+        |   with the recorder's gap table        |
+        +--------------------+-------------------+
+                             |
+                             v
+        confidence = model's, lowered one level per
+        gap overlap or removed sentence
+```
 
+Design rule: **the model may be wrong; the output may not be silently wrong.** If the checks remove everything, the answer says so rather than falling back to the model's prose.
+
+A claim, as returned to the client:
+
+```json
+{
+  "text": "Strike spread is under 5 bps 91% of the time",
+  "tool": "scorecard",
+  "args": {"window_minutes": 60},
+  "value": 0.91
+}
+```
 
 ---
 
 ## 4. Using the app
 
-### 4.1 If you are on the Strike team (is our book healthy, and what would a programme buy?)
+### 4.1 In the browser
 
-1. Open **/scorecard**. Pick a window (1 hour is the default). The four cards at the top are Strike on its own: spread uptime, depth
-   within 10 bps, slippage for a $50k order and the cancel/fill ratio, each with the change against the window before it.
-2. Scroll to **"Versus Binance and Hyperliquid"**. The gap is the size of the opportunity, not a verdict. `n/a` means the venue's public
-   feed does not reach that price band; Follow never extrapolates.
-3. Open **/designer**. Enter a maker rebate (bps), the number of Quoters and each Quoter's quote size. Press *Model on the live book*.
-   Read the table (recorded book vs modelled) and the printed assumptions. The banner reminds you this is a what-if, not a forecast.
-   Change the assumed adverse-selection cost to see how sensitive the result is.
-4. Open **/data** to download the evidence behind any number.
+1. Open the **Ask** page.
+2. Click a suggested question or type your own. Good questions name a venue, a size or a window: *"Compare Binance and Strike depth within 10 bps"*, *"What happened to Strike's spread uptime in the last hour?"*.
+3. Wait a few seconds (a typical question takes 2 to 4 model calls).
+4. Read in this order:
+   - **Confidence badge.** Low means: read the gaps box before trusting any number.
+   - **Gaps box.** Time ranges where the recorder was not watching. Numbers around them are measured on what was recorded, never interpolated.
+   - **Answer.** Each number is also in an evidence card.
+   - **Evidence cards.** Tool name, arguments and the value. If you disagree with an answer, this is where to check it.
+5. If an answer is shorter than you expected, that is the verifier removing a sentence it could not back. Ask again more narrowly.
 
-### 4.2 If you are a market maker or Quoter
-
-Look at **depth within 5/10 bps**, **slippage** and the **"What only L3 shows"** section: how many orders are placed versus cancelled versus
-filled, and how quickly depth returns after a large taker order (M5). The findings carousel on the landing page summarises it.
-
-### 4.3 If you are a trader or builder
-
-- On the landing page use the widget *"What does a market order cost right now?"*: pick $10k, $50k or $100k and compare Strike, Binance
-  and Hyperliquid on the latest 2-second sample.
-- Pull data programmatically:
+### 4.2 From the command line
 
 ```bash
-# current health of the four feeds
-curl http://localhost:8000/api/health
-
-# scorecard for the last 60 minutes (all venues)
-curl "http://localhost:8000/api/scorecard?window_minutes=60"
-
-# metric values for a time range (unix ms), 1-minute buckets
-curl "http://localhost:8000/api/query?start=1792700000000&end=1792703600000&step=minute"
-
-# what the incentive model says (POST)
-curl -X POST http://localhost:8000/api/designer -H "content-type: application/json" \
-     -d '{"rebate_bps":1,"n_quoters":3,"quote_size_usd":50000}'
-
-# list the Parquet files, then download one
-curl http://localhost:8000/api/dataset
-curl -O http://localhost:8000/api/dataset/gaps.parquet
+curl -s -X POST http://localhost:8010/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question":"How deep is Strike BTC within 10 bps right now?"}'
 ```
 
-### 4.4 API reference
+Response (shortened):
 
-| Endpoint | Returns |
-| --- | --- |
-| `GET /api/health` | per-feed heartbeat age and ok flag |
-| `GET /api/coverage` | hours recorded, sample coverage and gap time per venue |
-| `GET /api/gaps` | every marked gap (venue, start, end, reason) |
-| `GET /api/scorecard?window_minutes=&compare=prev\|day\|week` | latest window and its comparison (previous window, 24 h or 7 days earlier) for every venue, M4, and since-start values |
-| `GET /api/series?venue=&step=&hours=` | time series of M1 to M3 |
-| `GET /api/query?start=&end=&step=` | the read-only metric-range endpoint from the PRD |
-| `GET /api/cancel_fill?step=&hours=` | M4 series |
-| `GET /api/resilience?hours=&min_usd=` | M5 events and median recovery |
-| `GET /api/toxicity?hours=&horizon_s=` | M6: mean, median and hourly series of the post-trade mid move |
-| `GET /api/alerts` | feed-stale and recovered alerts (also POSTed to `ALERT_WEBHOOK_URL` if set) |
-| `GET /api/latest`, `GET /api/book` | latest sample per venue; latest Strike book levels |
-| `POST /api/designer` | the what-if model on the current recorded book |
-| `GET /api/dataset`, `/api/dataset/{file}`, `/api/dataset/schema` | Parquet export and schema |
+```json
+{
+  "answer": "Strike shows about $210k of resting depth within 10 bps ...",
+  "claims": [{"text": "...", "tool": "scorecard", "args": {"window_minutes": 60}, "value": 210000}],
+  "gaps_affecting_answer": [],
+  "confidence": "high",
+  "evidence": [{"tool": "scorecard", "args": {"window_minutes": 60}, "result": {"...": "..."}}]
+}
+```
 
-Interactive docs are served at `/docs`.
+Errors: `503` no model key configured; `502` the model or a tool failed (the message says which); `429` rate limit (12 questions per hour per IP).
+
+### 4.3 Other pages
+
+| Page | What it is for |
+|---|---|
+| `/scorecard` | The six metrics per venue, with `compare=prev|day|week` |
+| `/designer` | Test incentive-program settings against the recorded book |
+| `/methodology` | Exact definitions and how gaps are handled |
+| `/data` | Download the Parquet export of recorded samples |
 
 ---
 
 ## 5. Run it yourself
 
-Prerequisites: Python 3.11+, Node 20+. No API keys, wallets or accounts are needed: every feed is public.
+Requirements: Python 3.11+, Node 20+, a recorded database (or the bundled snapshot), and an NVIDIA API key.
 
 ```bash
-# 1. backend
+git clone https://github.com/SamuelDharshi/follow.git
+cd follow
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-python -m follow.recorder        # starts all four recorders, writes data/follow.db
-python -m follow.api             # API on http://localhost:8000  (docs at /docs)
+cp .env.example .env                                   # then fill in the keys below
+```
 
-# 2. frontend
+| Variable | Needed | Meaning |
+|---|---|---|
+| `NVIDIA_API_KEY` | yes | Key for `https://integrate.api.nvidia.com/v1` |
+| `AGENT_MODEL` | no | Default `nvidia/nemotron-3.5-lightning-30b-a3b`. Leave blank for default |
+| `FOLLOW_DB` | yes* | Path to the recorded SQLite file |
+| `SNAPSHOT_MODE` | no | `1` serves `snapshot/follow-snapshot.db` read-only (*replaces `FOLLOW_DB`) |
+| `FOLLOW_EXPORT_DIR` | no | Where Parquet exports are written |
+| `ZETARIS_BASE_URL`, `ZETARIS_ORG_ID`, `ZETARIS_USERNAME`, `ZETARIS_PASSWORD`, `ZETARIS_SAMPLES_TABLE` | no | Enables the `zetaris_depth_summary` tool; hidden from the agent until all are set |
+| `ZETARIS_API_KEY` | no | Optional token; login credentials are the fallback |
+| `API_PORT` | no | Default 8000; examples below use 8010 |
+
+**Backend, no recorder (uses the snapshot):**
+
+```bash
+SNAPSHOT_MODE=1 API_PORT=8010 python -m follow.api
+```
+
+**Backend with live recording** (needs outbound access to Strike, Binance and Hyperliquid):
+
+```bash
+python -m follow.recorder          # records Strike, Binance and Hyperliquid
+API_PORT=8010 python -m follow.api
+```
+
+**Front end:**
+
+```bash
 cd web
 npm install
-npm run build && npx next start -p 3002     # or: npm run dev
-# the frontend reads NEXT_PUBLIC_API_URL (web/.env.local); default http://localhost:8000
+NEXT_PUBLIC_API_URL=http://localhost:8010 npm run dev -- -p 3010
 ```
 
-The recorder must run continuously. Strike has **no history endpoint**, so every hour it is down is a permanent, marked gap.
-`run_recorder.cmd` restarts it if it exits; `deploy/*.service` and `docker-compose.yml` run it on a server.
+Open `http://localhost:3010/ask`.
 
-Configuration lives in `.env` (see `.env.example`). Everything the product reads is public; the pending section lists only deployment
-values you supply.
-
-### 5.1 Verify our work
+**Optional: Zetaris locally.** Start the Zetaris Docker bundle (UI on 3000, API on 8888), set the five `ZETARIS_*` variables, then load the samples once:
 
 ```bash
-python -m follow.verify           # sequence continuity, replay vs REST checkpoints, bookTicker cross-check
-python -m follow.verify --live    # sync a fresh book, run 30 s, diff against a brand-new REST snapshot
-python -m pytest tests            # arithmetic tests + tests on recorded real data
-node web/scripts/make_demo.mjs <url> demo   # records the captioned demo video of the live site (real data)
-python -m follow.analyze_churn    # reproduces every number quoted in FEEDBACK.md
+python -m follow.export            # writes Parquet under FOLLOW_EXPORT_DIR
+# create the table over the Parquet file with Zetaris DDL (JDBC), e.g.
+# CREATE LIGHTNING FILESTORE TABLE follow.book_samples ... FORMAT PARQUET OPTIONS (PATH '...')
 ```
 
-What these show today: the rebuilt L3 book matches Strike's REST snapshots order for order in all checkpoint replays (zero mismatches,
-zero sequence holes), a deliberately dropped real event is shown to corrupt the book (which is why any gap forces a rebuild), and
-100% of L3 fills recorded while the market feed was connected appear on Strike's public trade tape.
+The REST endpoint only accepts `SELECT`, so DDL goes through JDBC (see [FEEDBACK.md](FEEDBACK.md)).
+
+**Tests:**
+
+```bash
+pytest -q          # 21 tests: metrics, real-data checks, agent honesty rules
+```
+
+**Troubleshooting**
+
+| Symptom | Cause |
+|---|---|
+| `/api/ask` returns 503 | `NVIDIA_API_KEY` not set |
+| Answer says nothing, confidence low | The verifier removed every unbacked sentence; ask a narrower question |
+| Model call returns 404 or 410 | Model not enabled or retired for your key; set `AGENT_MODEL` to one that is |
+| Empty model replies, slow | Thinking mode on; Follow turns it off for NVIDIA by default |
+| Web page says "Cannot reach the API" | `NEXT_PUBLIC_API_URL` wrong or API not running |
 
 ---
 
-## 6. Strike interactions (what we call, and why)
+## 6. Sponsor technologies
 
-| Strike interface | Use in Follow |
-| --- | --- |
-| `GET /v2/l3/snapshot?symbol=BTC-USD` | full book at a sequence: at every session start, and every 10 minutes as a verification checkpoint |
-| `wss://api.strikefinance.org/ws/l3` (`btc-usd@l3`) | every order-level update; buffered, then applied from `last_sequence + 1` |
-| `wss://api.strikefinance.org/ws/price` (`trade`, `bookTicker`) | public trade tape and top of book, to cross-check the rebuilt book |
+| Sponsor | Used? | How, and how deeply |
+|---|---|---|
+| **NVIDIA** | Yes, core | Nemotron (`nvidia/nemotron-3.5-lightning-30b-a3b`) through the hosted OpenAI-compatible API runs the tool-calling loop. Thinking mode is switched off per request (it exhausted the token budget). |
+| **Zetaris** | Yes, optional tool | A local Zetaris platform queries a Parquet export of 104,664 book samples through SQL, exposed to the agent as `zetaris_depth_summary`. The data is a one-time snapshot, not live. |
+| **Meterless** | Partly | `follow/hmem.py` implements a Python subset of the H-MEM spec: tiers (0.6, 0.8, 1.0 weights), required source/confidence/provenance, supersession, retrieval threshold 0.35. It is not Meterless's engine and has not been conformance-tested. |
+| **SpaceX AI** | No | Not used. |
 
-Limits respected: one L3 connection, one market connection, one snapshot every 10 minutes (the limit is 10 per second). No
-authentication is involved.
-
----
-
-## 7. Repository layout
-
-```
-follow/            Python package
-  strike_l3.py       L3 recorder: snapshot + stream sync, gap detection, local book, burst-aware sampling
-  strike_market.py   trade tape + bookTicker
-  binance.py         Binance depth book (futures when reachable, else the public spot mirror; logged)
-  hyperliquid.py     Hyperliquid l2Book at two granularities
-  book.py            local L3 book          ladder.py   metric arithmetic (same code for every venue)
-  metrics.py         rollups, M4, M5        designer.py the labelled what-if model
-  api.py             read-only FastAPI      export.py   Parquet export
-  verify.py          replay + cross-checks  analyze_churn.py  reproduces FEEDBACK.md evidence
-tests/             arithmetic tests and tests on recorded real data
-web/               Next.js frontend (landing, scorecard, designer, methodology, dataset)
-docs/DATASET.md    dataset schema
-deploy/            systemd units          Dockerfile, docker-compose.yml
-FEEDBACK.md        the pain point we found in Strike's L3 design, with evidence and a proposed fix
-```
+What we found building with them, and a proposed fix, is in [FEEDBACK.md](FEEDBACK.md); [scripts/probe_sponsors.py](scripts/probe_sponsors.py) reproduces it.
 
 ---
 
-## 8. Honest limits
+## 7. The data underneath
 
-- **The PRD's data targets were not met.** The recorder started on Oct 22 at 00:54 IST. By Oct 23 10:36 IST that is 33.7 hours of wall-clock
-  time, of which **11.3 hours were actually recorded (about 33%)**. The rest is 22.4 hours of marked gaps: one 1.2 h network drop and two
-  laptop sleeps (12.9 h and 7.8 h). The PRD asked for 30+ hours recorded at 95%+ uptime. History cannot be backfilled because Strike has no
-  replay endpoint. Live figures are at `/api/coverage` and on the scorecard; no gap is ever interpolated.
-- **BTC-USD only**, because that is the only symbol with public L3.
-- **Strike volume is very thin.** The dataset holds about 1,070 fills, so cancel/fill and depth resilience (M5) rest on small samples. Sample
-  sizes are printed beside every number.
-- **The Binance series mixes two instruments.** It is the USD-M perpetual (BTCUSDT) except from about Oct 22 19:26 IST to Oct 23 10:30 IST, when
-  Binance's main domains were unreachable from the recorder host and it fell back to the public spot mirror. Each switch is logged and shown on the
-  scorecard. Hyperliquid streams only 20 levels per side, so wide depth bands are `n/a`.
-- **Strike's book is sampled between refresh bursts.** Strike refreshes its whole book once a second as about 190 unbracketed events, and
-  sampling mid-burst understated Strike (spread uptime 86% instead of 100%). Strike samples are now taken between bursts, using Strike's own event timestamps, and Strike's history
-  was re-derived from the raw stored events (`python -m follow.resample`). Benchmark samples are live and were not rebuilt. Evidence and the proposed
-  fix are in [FEEDBACK.md](FEEDBACK.md).
-- **Visible liquidity only.** L3 shows resting orders, not intent, and an order can be cancelled before a taker reaches it. Strike's quotes
-  are refreshed every second (median resting time 993 ms), so displayed depth reflects the refresh schedule as much as committed capital
-  ([FEEDBACK.md](FEEDBACK.md), section 5).
-- **The designer is a model**, not a forecast, and says so on the page.
-- **M6 is Strike-only and coarse.** The price move uses the 2-second book samples (the last one before the trade and the first one at least 10 s
-  after), over about 1,000 taker orders, so treat it as an average, not a per-trade measurement.
+```
+ Strike L3 feed ----+                  one number's journey
+ Strike /ws/price --+--> recorder ---> raw events (exchange timestamps)
+ Binance -----------+        |                |
+ Hyperliquid -------+        |                v
+                             |        burst-aware 2-second samples
+                             |                |
+                  sequence gap?               v
+                  mark gap, re-snapshot   rollups (1m / 1h / 1d)
+                  never interpolate           |
+                                              v
+                              metric function -> API -> agent tool -> claim -> UI
+```
+
+- **Strike L3.** REST snapshot plus WebSocket with per-symbol sequence numbers. A skipped sequence number writes a gap row and triggers a fresh snapshot.
+- **Burst-aware sampling.** Strike refreshes its whole book about once a second as roughly 190 unbracketed events (measured: median resting time 993 ms; 32% of bursts end state-neutral). Samples are taken only once 50 ms of quiet has passed on exchange timestamps, so a sample never lands mid-refresh.
+- **Metrics.** M1 spread uptime, M2 depth within 5/10/25 bps, M3 slippage at $10k/$50k/$100k, M4 cancel/fill, M5 depth resilience, M6 flow toxicity. Definitions in `/methodology`.
+- **Binance** uses futures with a spot-mirror fallback when the main domain is blocked; **Hyperliquid** uses `l2Book` at two granularities.
 
 ---
 
-## 9. Live deployment
+## 8. Repository layout
 
-| Piece | Where |
-| --- | --- |
-| Frontend | not deployed yet (Next.js; set `NEXT_PUBLIC_API_URL` at build time) |
-| API + recorder | the recorder machine, exposed through an ngrok HTTPS tunnel (India region) |
-| Keep-alive | `supervise_stack.ps1` restarts the recorder, API, website and tunnel; sleep and hibernate are disabled on the host |
-
-A tunnel to a laptop is not a production setup: the live numbers are only as available as that machine. The same code runs on any VPS with
-`docker compose up -d` or the systemd units in `deploy/`, which is how it should be run long term. Set `ALERT_WEBHOOK_URL` in `.env` to get
-a Discord or Slack message when a feed goes stale.
-
-### Hosting without the recorder machine (Render)
-
-`render.yaml` deploys the API from `snapshot/follow-snapshot.db`, a compact snapshot of the real recorded database (every book sample, rollup,
-gap, fill and trade; the 11M raw cancel/open events are summarised by the per-minute rollup). The site labels this mode ("recorded data" with the
-snapshot date) and nothing is generated. Rebuild it with `python -m follow.snapshot`. Live recording still needs an always-on machine.
+```
+follow/
+  agent.py         tool catalogue, model backends, verification, ask() loop
+  hmem.py          H-MEM-shaped memory subset (JSON file next to the DB)
+  zetaris.py       Zetaris REST client (login, SELECT, numeric coercion)
+  api.py           FastAPI app incl. POST /api/ask
+  metrics.py       M1-M6
+  recorder.py, strike_l3.py, strike_market.py, binance.py, hyperliquid.py
+  book.py, ladder.py, resample.py, analyze_churn.py, snapshot.py
+  designer.py, export.py, verify.py, db.py, config.py, supervisor.py, status.py
+tests/             test_agent.py, test_ladder.py, test_real_data.py
+scripts/           probe_sponsors.py
+web/               Next.js front end (see web/README.md)
+snapshot/          read-only recorded database for SNAPSHOT_MODE
+deploy/, Dockerfile, docker-compose.yml, render.yaml   packaging
+FEEDBACK.md        sponsor-technology findings and proposed fix
+PHASES.md          build plan
+```
 
 ---
 
-## What's new for Open Agent Hackathon 2026: Ask Follow
+## 9. Honest limits
 
-Follow was a dashboard. **Ask Follow** adds an investigator agent for questions like *"Why was Strike slippage worse than Binance yesterday?"*.
-
-```
- question -> plan -> tool calls (max 6) -> JSON answer -> CODE verifies every number -> answer + evidence
-                       |  coverage, scorecard, series, gaps, resilience, toxicity, cancel_fill
-                       |  (the same functions behind /api/*, never raw SQL)
-```
-
-- **Tools, not SQL.** `follow/agent.py` exposes seven tools backed by the existing metric functions. The model reads their output and nothing else.
-- **The honesty rule is enforced in code, not in the prompt.** Each claim must cite a tool that was actually called, and its value must appear in that tool's result
-  (fractions shown as percentages and k/M scaling are accepted). Claims that fail are dropped; any answer sentence containing a number no surviving claim supports is
-  removed. `tests/test_agent.py` checks this against real tool output.
-- **Gaps are reported by code.** Every window a claim rests on is intersected with the recorder's gap table, and overlapping outages are returned and shown, lowering confidence.
-- **Endpoint and page.** `POST /api/ask {"question": ...}` returns `answer`, `claims`, `gaps_affecting_answer`, `confidence` and the tool-call log; `/ask` shows the answer and an
-  evidence list with a mini chart per claim and five suggested questions. 12 questions per hour per IP.
-- **Models.** Nemotron through NVIDIA's OpenAI-compatible API when `NVIDIA_API_KEY` is set (`AGENT_MODEL` overrides the default `nvidia/nemotron-3.5-lightning-30b-a3b`), otherwise
-  any OpenAI-compatible endpoint (`OPENAI_API_KEY` + `AGENT_BASE_URL`) or Anthropic (`ANTHROPIC_API_KEY`). Keys stay on the server and are never sent to the browser.
-- **Memory (H-MEM-shaped).** `follow/hmem.py` stores every verified claim as a record in the shape of the open H-MEM spec from Meterless (tiers, required `source`, `confidence` and
-  `provenance`, `supersedes` links, hybrid ranked recall with a threshold), so follow-ups like "is that better than your last answer?" can use earlier findings. It is a small
-  Python subset of the spec, not the Meterless service, and it has not been run through their TypeScript conformance suite.
-- **Not done:** Zetaris is not integrated. It is an enterprise cloud product that needs an account and connection details; Meterless has no hosted service to call.
+- **Answer quality is uneven.** Some answers cite only one tool; occasionally the model returns no claims and the answer is empty; "takers" style questions can be over-trimmed by the verifier.
+- **The mini chart is always spread uptime**, whatever the claim is about.
+- **The verifier checks that a number was returned by a tool, not that the model drew the right conclusion from it.**
+- **Zetaris data is a snapshot**, refreshed by hand.
+- **Meterless support is a re-implementation of a subset**, not Meterless's software.
+- **Recorded history has gaps** (laptop sleep, network loss). They are stored and reported, never filled in.
+- **Rate limit** of 12 questions per hour per IP on `/api/ask`.
+- **Not financial advice.** Liquidity measured on past recorded samples says nothing certain about the next trade.
