@@ -390,7 +390,6 @@ web/               Next.js front end (see web/README.md)
 snapshot/          read-only recorded database for SNAPSHOT_MODE
 deploy/, Dockerfile, docker-compose.yml, render.yaml   packaging
 FEEDBACK.md        sponsor-technology findings and proposed fix
-PHASES.md          build plan
 ```
 
 ---
