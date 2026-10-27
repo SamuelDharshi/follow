@@ -1,0 +1,25 @@
+/data/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+
+# generated / local
+*.log
+web/package-lock.json
+.vscode/
+demo/
+
+# build output, secrets, local data
+node_modules/
+.next/
+.vercel/
+.env.local
+.env.*.local
+*.db-shm
+*.db-wal
+*.webm
+*.mp4
+docs/zetaris-openapi.yaml
+web/next-env.d.ts
+web/node_modules
