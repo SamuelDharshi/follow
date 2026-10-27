@@ -92,3 +92,11 @@ def test_zetaris_sql_is_parameterised_and_rejects_injection():
         zetaris.depth_summary_sql("book_samples; DROP TABLE x", "strike", 1, 2)
     with pytest.raises(ValueError):
         zetaris.depth_summary_sql("t", "strike' OR '1'='1", 1, 2)
+
+
+def test_zetaris_string_numbers_become_numbers_and_verify():
+    from follow import zetaris
+    assert zetaris._numeric("1421") == 1421 and zetaris._numeric("0.1999") == 0.1999 and zetaris._numeric("abc") == "abc"
+    calls = [{"id": "c1", "name": "zetaris_depth_summary", "args": {}, "result": {"rows": [{"avg_depth10_usd": zetaris._numeric("378066.25")}]}}]
+    kept = agent.verify([{"text": "average depth", "tool": "zetaris_depth_summary", "args": {}, "value": 378066.25}], calls)
+    assert len(kept) == 1

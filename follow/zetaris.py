@@ -55,6 +55,17 @@ def _call(method: str, path: str, **kw):
     raise RuntimeError(f"zetaris auth rejected ({last.status_code}): {last.text[:200]}")
 
 
+def _numeric(v):
+    """The REST API returns every value as a JSON string; give numbers back as numbers so claims about them can be verified."""
+    if isinstance(v, str):
+        try:
+            f = float(v)
+            return int(f) if f.is_integer() and "." not in v and "e" not in v.lower() else f
+        except ValueError:
+            return v
+    return v
+
+
 def query(sql: str, max_rows: int = 200) -> dict:
     """Run one SQL statement and return its rows. Always closes the query token."""
     start = _call("POST", "/api/v1.0/query/sql/start", json={"select": sql, "pageLimit": min(100, max_rows)}).json()
@@ -71,6 +82,7 @@ def query(sql: str, max_rows: int = 200) -> dict:
             _call("DELETE", f"/api/v1.0/query/sql/close/{token}")
         except Exception:  # noqa: BLE001
             pass
+    rows = [{k: _numeric(v) for k, v in r.items()} if isinstance(r, dict) else r for r in rows]
     return {"sql": sql, "total_count": start.get("totalCount"), "rows": rows[:max_rows]}
 
 
